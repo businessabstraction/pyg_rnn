@@ -1,3 +1,3 @@
 # Using Recurrent NN Layers with Pytorch Geometric (PyG)
 This Module allows creation of RNN layers within a PyG model without going through a padded tensor.
-Creating a padded tensor can be very prohibitive for a dataset with big lead and long tail For example, it you have 1 million groups of events, where most groups have 3-5 events (long take), but some have about 1000, you will need to create a padded tensor $1,000,000 x 1,000 x n", where $hn$ is the number of properties within each event. that can be 100 more than the number of elements 
+Creating a padded tensor can be very prohibitive for a dataset with big lead and long tail For example, it you have 1 million groups of events, where most groups have 3-5 events (long take), but some have about 1000, you will need to create a padded tensor $1,000,000 x 1,000 x n$, where $n$ is the number of properties within each event. that can be 100 more than the number of elements 
