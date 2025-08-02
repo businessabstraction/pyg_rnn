@@ -9,7 +9,7 @@ from torch.nn.utils.rnn import PackedSequence, pack_padded_sequence, pad_packed_
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import degree
 
-from ..utils.pack import sequence_ptr_from_edge_index  # helper described below
+from pyg_rnn.utils.pack import sequence_ptr_from_edge_index
 from collections import defaultdict
 
 
@@ -69,10 +69,12 @@ class RNNConv(MessagePassing):
         assert time_form != "sin", "time_form='sin' is not implemented yet"
         assert not bidirectional or rnn_cls in [nn.LSTM, nn.GRU], "bidirectional=True is only supported for LSTM and GRU"
         assert not bidirectional, "bidirectional=True is not implemented yet"
-        assert edge_index.shape[1] == 2, "edge_index must be a (num_edges, 2) long tensor"
+        assert edge_index.shape[0] == 2, "edge_index must be a (num_edges, 2) long tensor"
+
+        print(f"Creating RNNConv with {rnn_cls.__name__} and edge_index shape {edge_index.shape} and event_time shape {event_time.shape}")
 
         self.input_dim = in_channels
-        self.time_channels = 0 if time_mode == "never" else {'raw': 1, '2d': 2, 'poly': 3}[time_form]
+        self.time_dim = 0 if time_mode == "never" else {'raw': 1, '2d': 2, 'poly': 3}[time_form]
         self.hidden_dim = hidden_channels if hidden_channels is not None else self.input_dim + self.time_channels
         self.time_mode = time_mode
         self.time_form = time_form
@@ -83,42 +85,43 @@ class RNNConv(MessagePassing):
         self.time_dim = {'raw': 1, '2d': 2, 'poly': 3}[time_form]
 
         self.sos_vector = nn.Parameter(torch.zeros(self.time_dim), requires_grad=True)
-        self.time_data = torch.tensor((event_time.shape[0], 1), dtype=torch.float32)
+        self.time_data = torch.empty_like(event_time)
+        print(f"created self.time_data with shape {self.time_data.shape} and dtype {self.time_data.dtype} out of {event_time.shape}, dtype {event_time.dtype}")
 
         if time_mode != 'each':
             self.rnn: nn.RNNBase = rnn_cls(
-                    input_size=self.input_dim + self.time_channels,
+                    input_size=self.input_dim + self.time_dim,
                     hidden_size=self.hidden_dim,
                     num_layers=num_layers,
                     bidirectional=bidirectional,
                     batch_first=True,  # we’ll pack anyway; batch_first simplifies unpacking
                     **rnn_kwargs,
                 )
-
+        print(self.rnn)
         self.out_channels = hidden_channels * (2 if bidirectional else 1)
 
         self.edge_index = edge_index.flip(0) if edge_reverse else edge_index
+        assert torch.max(self.edge_index[1]) < event_time.shape[0], f"Edge index max {torch.max(self.edge_index[1])} contains out-of-bounds indices for event_time < {event_time.shape[0]}"
+        print(f"Edge index max {torch.max(self.edge_index[1])} for event_time < {event_time.shape[0]}")
 
         run_ids = torch.arange(event_time.shape[0], dtype=torch.int64)
         nested_by_entity = defaultdict(list)
         for event_num in range(event_time.shape[0]):
-            event_time = event_time[event_num]
+            present_event_time = event_time[event_num]
             entity_ind_tensor = self.edge_index[0][self.edge_index[1] == event_num]
             entity_ind_list = entity_ind_tensor.tolist()
             assert len(entity_ind_list) == 1, f"Event {event_num} has {len(entity_ind_list)} Entities, expected 1"
             entity_list  = nested_by_entity[entity_ind_list[0]]
             prev_event_time = entity_list[-1] if entity_list else None
             entity_list.append(event_num)
-            time_delta = event_time - prev_event_time if prev_event_time is not None else torch.nan
-            self.time_data[event_num] = [time_delta] 
+            time_delta = present_event_time - prev_event_time if prev_event_time is not None else torch.nan
+            self.time_data[event_num] = time_delta 
 
-        self.nanmask = torch.isnan(self.time_data.squeeze())
+        self.nanmask = torch.isnan(self.time_data)
         nested_tensors = [torch.tensor(v, dtype=torch.int64) for v in nested_by_entity.values()]
         events_packed = torch.nn.utils.rnn.pack_sequence(nested_tensors, enforce_sorted=False)
         self.perm = events_packed.data
         self.batch_sizes = events_packed.batch_sizes
-
-        self.time_delta 
         
 
         self.encode2d = torch.nn.Linear(1, 2) if time_form == "2d" else None
@@ -151,9 +154,11 @@ class RNNConv(MessagePassing):
             time_delta = self.encode2d(self.time_data.unsqueeze(-1))  # [num_events, 2]
         time_delta[self.nanmask] = self.sos_vector
 
+        print(f"time_delta shape: {time_delta.shape}, nanmask shape: {self.nanmask.shape}, sos_vector shape: {self.sos_vector.shape}")
+
         add_time = torch.cat((x, time_delta), dim=-1)
 
-        event_prepacked = x[self.perm]
+        event_prepacked = add_time[self.perm]
 
         run_packed = torch.nn.utils.rnn.PackedSequence(event_prepacked, batch_sizes=self.batch_sizes.cpu().long())  # [1, num_runs, RUN_POST_COMP]
 
