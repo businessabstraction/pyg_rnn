@@ -8,6 +8,7 @@ from torch import nn, Tensor
 from torch.nn.utils.rnn import PackedSequence, pack_padded_sequence, pad_packed_sequence
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import degree
+from torch_scatter import scatter
 
 from pyg_rnn.utils.pack import sequence_ptr_from_edge_index
 from collections import defaultdict
@@ -70,6 +71,8 @@ class RNNConv(MessagePassing):
         assert not bidirectional or rnn_cls in [nn.LSTM, nn.GRU], "bidirectional=True is only supported for LSTM and GRU"
         assert not bidirectional, "bidirectional=True is not implemented yet"
         assert edge_index.shape[0] == 2, "edge_index must be a (num_edges, 2) long tensor"
+        if edge_index.numel() == 0:
+            raise ValueError("RNNConv requires a non-empty edge_index, but received an empty tensor.")
 
         print(f"Creating RNNConv with {rnn_cls.__name__} and edge_index shape {edge_index.shape} and event_time shape {event_time.shape}")
 
@@ -85,8 +88,7 @@ class RNNConv(MessagePassing):
         self.time_dim = {'raw': 1, '2d': 2, 'poly': 3}[time_form]
 
         self.sos_vector = nn.Parameter(torch.zeros(self.time_dim), requires_grad=True)
-        self.time_data = torch.empty_like(event_time)
-        print(f"created self.time_data with shape {self.time_data.shape} and dtype {self.time_data.dtype} out of {event_time.shape}, dtype {event_time.dtype}")
+        self.time_data = (torch.empty_like(event_time)).float()
 
         if time_mode != 'each':
             self.rnn: nn.RNNBase = rnn_cls(
@@ -102,7 +104,6 @@ class RNNConv(MessagePassing):
 
         self.edge_index = edge_index.flip(0) if edge_reverse else edge_index
         assert torch.max(self.edge_index[1]) < event_time.shape[0], f"Edge index max {torch.max(self.edge_index[1])} contains out-of-bounds indices for event_time < {event_time.shape[0]}"
-        print(f"Edge index max {torch.max(self.edge_index[1])} for event_time < {event_time.shape[0]}")
 
         run_ids = torch.arange(event_time.shape[0], dtype=torch.int64)
         nested_by_entity = defaultdict(list)
@@ -115,7 +116,7 @@ class RNNConv(MessagePassing):
             prev_event_time = entity_list[-1] if entity_list else None
             entity_list.append(event_num)
             time_delta = present_event_time - prev_event_time if prev_event_time is not None else torch.nan
-            self.time_data[event_num] = time_delta 
+            self.time_data[event_num] = float(time_delta) 
 
         self.nanmask = torch.isnan(self.time_data)
         nested_tensors = [torch.tensor(v, dtype=torch.int64) for v in nested_by_entity.values()]
@@ -140,21 +141,28 @@ class RNNConv(MessagePassing):
             elif "bias" in name:
                 nn.init.zeros_(param)
 
+        if self.encode2d is not None:
+            nn.init.xavier_uniform_(self.encode2d.weight)
+            nn.init.zeros_(self.encode2d.bias)
+
     def forward(
         self,
         x: Tensor,                # [num_events, in_channels]
     ) -> Tensor:                  # [num_events, out_channels]
         # 1. Build sequence pointers sorted by dst timestamp
+        current_dtype = next(self.parameters()).dtype
+        the_time__data = self.time_data.to(dtype=current_dtype)  # [num_events]
 
         if self.time_form == 'raw':
-            time_delta = self.time_data.unsqueeze(-1)  # [num_events, 1]
+            time_delta = the_time__data.unsqueeze(-1)  # [num_events, 1]
         elif self.time_form == 'poly':
-            time_delta = torch.stack((self.time_data, self.time_data ** 2, torch.log(self.time_data + 1e-6)), dim=-1)
+            safe_time_data = torch.clamp(the_time__data, min=1e-3)
+            time_delta = torch.stack((safe_time_data, safe_time_data ** 2, torch.log(safe_time_data)), dim=-1)
         elif self.time_form == '2d':
-            time_delta = self.encode2d(self.time_data.unsqueeze(-1))  # [num_events, 2]
+            time_delta = self.encode2d(the_time__data.unsqueeze(-1))  # [num_events, 2]
         time_delta[self.nanmask] = self.sos_vector
 
-        print(f"time_delta shape: {time_delta.shape}, nanmask shape: {self.nanmask.shape}, sos_vector shape: {self.sos_vector.shape}")
+        #time_delta = time_delta if x.dtype == torch.float else time_delta.to(dtype=x.dtype)
 
         add_time = torch.cat((x, time_delta), dim=-1)
 
@@ -166,7 +174,8 @@ class RNNConv(MessagePassing):
 
         run_grued = torch.empty_like(run_grued_packed.data)
 
-        run_grued[self.perm] = run_grued_packed.data
+        #run_grued[self.perm] = run_grued_packed.data
+        run_grued = scatter(run_grued_packed.data, self.perm, dim=0, dim_size=x.size(0), reduce='sum')
 
 
         return run_grued
