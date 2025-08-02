@@ -15,35 +15,50 @@ from collections import defaultdict
 
 
 class RNNConv(MessagePassing):
-    r"""Applies any *PyTorch* RNN to variable-length, per-node event sequences.
+    r"""Applies a PyTorch RNN (e.g., GRU, LSTM, RNN) to variable-length sequences of node-associated events within a PyTorch Geometric graph structure.
 
     Parameters
     ----------
     rnn_cls : Type[nn.RNNBase]
-        A constructor for an RNN class (`nn.GRU`, `nn.LSTM`, `nn.RNN`, …).
-    edge_index : PyG (num_edges, 2) long tensor, representing edges from Entities to Events.
-    event_time : Tensor or time associated with Events. IMPORTANT: Events should be ordered by 
-                time prior to invoking RNNConv. The constructor may throw an Exception if 
-                encounters a step back in time.
-    time_channel: the parameter name specifies the time of event. Default 'time'.
+        Constructor for a PyTorch RNN module, e.g., `nn.GRU`, `nn.LSTM`, or `nn.RNN`.
+    edge_index : torch.LongTensor [2, num_edges]
+        Tensor representing edges from entity nodes (sources) to event nodes (targets). Shape: `[2, num_edges]`.
+    event_time : torch.Tensor [num_events]
+        Tensor containing timestamps associated with each event node. Events must be pre-sorted chronologically.
     in_channels : int
-        Size of the input event features  *x*.
-    hidden_channels : int
-        Hidden size used inside the RNN. Default None, which means the same as `in_channels`.
+        Dimension of input feature vectors for event nodes.
+    hidden_channels : int, optional
+        Hidden dimension used within the RNN. Defaults to `in_channels` if not provided.
     num_layers : int, optional
-        Number of stacked RNN layers (default: 1).
+        Number of stacked RNN layers (default: `1`).
     edge_reverse : bool, optional
-        If *True*, reverse the direction of edges in `edge_index` (default: *False*).
-        
+        If `True`, reverses edge direction in `edge_index` (default: `False`).
     bidirectional : bool, optional
-        If *True*, use a bidirectional RNN (default: *False*).
-    time_mode : str, optional
-        Whether to inject time once before multy-layer RNN, after each layer, or never. ['once', 'each', 'never'] (Default 'once')
-    time_form: str ['raw', '2d', 'sin', 'poly'], optional. Default is 'raw'. 'poly' means concat [Δt, Δt², log Δt] . '2d' means a Linear([1,2]) layer applied to Δt.
-    each_proc: Module, optional
-        A module that is applied to each event either before RNN, or before each RNN layer. if defined, overwrites time_form. (Default None)
-    **rnn_kwargs
-        Extra keyword arguments forwarded verbatim to `rnn_cls`.
+        If `True`, utilizes a bidirectional RNN (default: `False`).
+    time_mode : {'once', 'each', 'never'}, optional
+        Specifies when temporal features are injected relative to RNN layers. Currently supports `'once'` (default) and `'never'`.
+    time_form : {'raw', '2d', 'poly'}, optional
+        Method to encode temporal deltas:
+        - `'raw'`: Uses Δt directly.
+        - `'2d'`: Projects Δt via a linear layer from 1→2 dimensions.
+        - `'poly'`: Concatenates `[Δt, Δt², log(Δt)]`.
+        Default is `'raw'`.
+    each_proc : nn.Module, optional
+        Custom module applied to events before RNN processing. Overrides `time_form` if provided (not implemented yet).
+    **rnn_kwargs : dict
+        Additional keyword arguments forwarded directly to the underlying RNN constructor.
+
+    Attributes
+    ----------
+    out_channels : int
+        Output feature dimension, determined by `hidden_channels` and RNN directionality.
+    rnn : nn.RNNBase
+        The underlying PyTorch RNN instance.
+    encode2d : nn.Linear or None
+        Linear transformation layer used if `time_form='2d'`; otherwise, None.
+    sos_vector : nn.Parameter
+        Learnable vector used as a temporal encoding placeholder for events without preceding timestamps.
+
     """
 
     def __init__(
@@ -61,6 +76,15 @@ class RNNConv(MessagePassing):
         each_proc: nn.Module | None = None,
         **rnn_kwargs,
     ):
+        """Initializes internal components, validates parameters, and prepares tensors for RNN processing.
+
+        Raises
+        ------
+        ValueError
+            If provided `edge_index` tensor is empty or incorrectly shaped.
+        AssertionError
+            If `time_mode`, `time_form`, or other parameters are not supported or invalid.
+        """
         super().__init__(aggr="add", node_dim=0)  # aggregation unused but required
         assert each_proc is None or isinstance(each_proc, nn.Module), "each_proc must be a nn.Module"
         assert each_proc is None, "each_proc is not implemented yet"
@@ -135,6 +159,7 @@ class RNNConv(MessagePassing):
     #  Public API                                                           #
     # --------------------------------------------------------------------- #
     def reset_parameters(self) -> None:
+        """Initializes or resets parameters of the internal RNN and temporal encoding layers."""
         for name, param in self.rnn.named_parameters():
             if "weight" in name:
                 nn.init.xavier_uniform_(param)
@@ -149,6 +174,22 @@ class RNNConv(MessagePassing):
         self,
         x: Tensor,                # [num_events, in_channels]
     ) -> Tensor:                  # [num_events, out_channels]
+        """Executes a forward pass of the RNN convolution, incorporating temporal features.
+
+        Parameters
+        ----------
+        x : torch.Tensor [num_events, in_channels]
+            Input tensor containing event node features.
+
+        Returns
+        -------
+        torch.Tensor [num_events, out_channels]
+            Tensor containing the processed event node features after applying the RNN-based convolution.
+
+        Notes
+        -----
+        This method internally manages dtype consistency to ensure compatibility with PyTorch autograd mechanisms.
+        """
         # 1. Build sequence pointers sorted by dst timestamp
         current_dtype = next(self.parameters()).dtype
         the_time__data = self.time_data.to(dtype=current_dtype)  # [num_events]
