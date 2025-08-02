@@ -1,7 +1,7 @@
 import torch
 import pytest
 from torch_geometric.data import HeteroData
-from pyg_rnn.nn import RNNConv
+from pyg_rnn import RNNConv
 
 @pytest.fixture
 def hetero_example():
