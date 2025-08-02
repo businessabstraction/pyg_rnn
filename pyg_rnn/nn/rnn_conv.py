@@ -21,8 +21,9 @@ class RNNConv(MessagePassing):
     rnn_cls : Type[nn.RNNBase]
         A constructor for an RNN class (`nn.GRU`, `nn.LSTM`, `nn.RNN`, …).
     edge_index : PyG (num_edges, 2) long tensor, representing edges from Entities to Events.
-    events: Tensor. Provided for .time only. Not to be saved as a parameter, as the actual 
-                Events tensor will be have the same number of entries, but with different values
+    event_time : Tensor or time associated with Events. IMPORTANT: Events should be ordered by 
+                time prior to invoking RNNConv. The constructor may throw an Exception if 
+                encounters a step back in time.
     time_channel: the parameter name specifies the time of event. Default 'time'.
     in_channels : int
         Size of the input event features  *x*.
@@ -30,6 +31,9 @@ class RNNConv(MessagePassing):
         Hidden size used inside the RNN. Default None, which means the same as `in_channels`.
     num_layers : int, optional
         Number of stacked RNN layers (default: 1).
+    edge_reverse : bool, optional
+        If *True*, reverse the direction of edges in `edge_index` (default: *False*).
+        
     bidirectional : bool, optional
         If *True*, use a bidirectional RNN (default: *False*).
     time_mode : str, optional
@@ -45,11 +49,11 @@ class RNNConv(MessagePassing):
         self,
         rnn_cls: Type[nn.RNNBase],
         edge_index: Tensor,
-        events: Tensor, 
+        event_time: Tensor, 
         in_channels: int,
         hidden_channels: int = None,
-        time_channel: str = "time",
         num_layers: int = 1,
+        edge_reverse: bool = False,
         bidirectional: bool = False,
         time_mode: str = "once",
         time_form: str = "raw",
@@ -73,7 +77,13 @@ class RNNConv(MessagePassing):
         self.time_mode = time_mode
         self.time_form = time_form
         self.each_proc = each_proc
+        self.edge_reverse = edge_reverse
         self.bidirectional = bidirectional
+
+        self.time_dim = {'raw': 1, '2d': 2, 'poly': 3}[time_form]
+
+        self.sos_vector = nn.Parameter(torch.zeros(self.time_dim), requires_grad=True)
+        self.time_data = torch.tensor((event_time.shape[0], 1), dtype=torch.float32)
 
         if time_mode != 'each':
             self.rnn: nn.RNNBase = rnn_cls(
@@ -87,22 +97,31 @@ class RNNConv(MessagePassing):
 
         self.out_channels = hidden_channels * (2 if bidirectional else 1)
 
-        self.edge_index = edge_index
+        self.edge_index = edge_index.flip(0) if edge_reverse else edge_index
 
-        run_ids = torch.arange(events.num_nodes, dtype=torch.int64)
+        run_ids = torch.arange(event_time.shape[0], dtype=torch.int64)
         nested_by_entity = defaultdict(list)
-        for event_num in range(events.shape[0]):
-            entity_ind_tensor = edge_index[0][edge_index[1] == event_num]
-        horse_ind_list = horse_ind_tensor.tolist()
-        assert len(horse_ind_list) == 1, f"Run {run_num} has {len(horse_ind_list)} Horses, expected 1"
-        horse_list  = nested_by_horse[horse_ind_list[0]]
-        horse_list.append(run_num)
-    print(f"Packed {len(nested_by_horse)} Horses with {sum(len(v) for v in nested_by_horse.values())} Runs") if report else None
-    nested_tensors = [torch.tensor(v, dtype=torch.int64) for v in nested_by_horse.values()]
-    run_packed = torch.nn.utils.rnn.pack_sequence(nested_tensors, enforce_sorted=False)  
-    sub_data['Run', 'packedhorse', 'Run'].edge_index = torch.stack([run_ids, run_packed.data], dim=0)
-    sub_data['Run', 'packedhorse', 'Run'].batch_sizes = run_packed.batch_sizes
-   
+        for event_num in range(event_time.shape[0]):
+            event_time = event_time[event_num]
+            entity_ind_tensor = self.edge_index[0][self.edge_index[1] == event_num]
+            entity_ind_list = entity_ind_tensor.tolist()
+            assert len(entity_ind_list) == 1, f"Event {event_num} has {len(entity_ind_list)} Entities, expected 1"
+            entity_list  = nested_by_entity[entity_ind_list[0]]
+            prev_event_time = entity_list[-1] if entity_list else None
+            entity_list.append(event_num)
+            time_delta = event_time - prev_event_time if prev_event_time is not None else torch.nan
+            self.time_data[event_num] = [time_delta] 
+
+        self.nanmask = torch.isnan(self.time_data.squeeze())
+        nested_tensors = [torch.tensor(v, dtype=torch.int64) for v in nested_by_entity.values()]
+        events_packed = torch.nn.utils.rnn.pack_sequence(nested_tensors, enforce_sorted=False)
+        self.perm = events_packed.data
+        self.batch_sizes = events_packed.batch_sizes
+
+        self.time_delta 
+        
+
+        self.encode2d = torch.nn.Linear(1, 2) if time_form == "2d" else None
 
         self.reset_parameters()
 
@@ -121,34 +140,29 @@ class RNNConv(MessagePassing):
     def forward(
         self,
         x: Tensor,                # [num_events, in_channels]
-        edge_index: Tensor,       # [2, num_edges]  (src → dst, *strictly* earlier ➜ later)
-        num_nodes: int | None = None,
     ) -> Tensor:                  # [num_events, out_channels]
         # 1. Build sequence pointers sorted by dst timestamp
-        seq_ptr = sequence_ptr_from_edge_index(edge_index, x.size(0), num_nodes)
 
-        # 2. Reorder events into (batch, time) layout expected by pack()
-        x_seq = x[seq_ptr.event_idx]                   # [total_time, in_channels]
-        lengths = seq_ptr.lengths.cpu()                # List[int]
+        if self.time_form == 'raw':
+            time_delta = self.time_data.unsqueeze(-1)  # [num_events, 1]
+        elif self.time_form == 'poly':
+            time_delta = torch.stack((self.time_data, self.time_data ** 2, torch.log(self.time_data + 1e-6)), dim=-1)
+        elif self.time_form == '2d':
+            time_delta = self.encode2d(self.time_data.unsqueeze(-1))  # [num_events, 2]
+        time_delta[self.nanmask] = self.sos_vector
 
-        # 3. Pack, run RNN, unpack
-        packed: PackedSequence = pack_padded_sequence(
-            x_seq, lengths=lengths, batch_first=True, enforce_sorted=False
-        )
-        y_seq, _ = self.rnn(packed)                    # y_seq.data  → [total_time, H]
-        y, _ = pad_packed_sequence(
-            PackedSequence(y_seq.data, packed.batch_sizes),
-            batch_first=True,
-        )                                              # [batch, max_len, H]
+        add_time = torch.cat((x, time_delta), dim=-1)
 
-        # 4. Map back to original event order
-        out = torch.empty(
-            (x.size(0), self.out_channels), device=x.device, dtype=y.dtype
-        )
-        out[seq_ptr.event_idx] = y.view(-1, self.out_channels)
+        event_prepacked = x[self.perm]
 
-        return out
+        run_packed = torch.nn.utils.rnn.PackedSequence(event_prepacked, batch_sizes=self.batch_sizes.cpu().long())  # [1, num_runs, RUN_POST_COMP]
 
-    # optional convenience so layer behaves like a PyG “conv”
-    def message(self, x_j: Tensor) -> Tensor:  # unused
-        return x_j
+        run_grued_packed = (self.rnn(run_packed))[0]  # [1, num_runs, RUN_POST_COMP]
+
+        run_grued = torch.empty_like(run_grued_packed.data)
+
+        run_grued[self.perm] = run_grued_packed.data
+
+
+        return run_grued
+
