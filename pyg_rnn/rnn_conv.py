@@ -100,16 +100,21 @@ class RNNConv(MessagePassing):
 
         print(f"Creating RNNConv with {rnn_cls.__name__} and edge_index shape {edge_index.shape} and event_time shape {event_time.shape}")
 
+        self.num_events = event_time.shape[0]
+
+
+        self.time_dim = {'raw': 1, '2d': 2, 'poly': 3}[time_form]
+        
         self.input_dim = in_channels
         self.time_dim = 0 if time_mode == "never" else {'raw': 1, '2d': 2, 'poly': 3}[time_form]
-        self.hidden_dim = hidden_channels if hidden_channels is not None else self.input_dim + self.time_channels
+        self.hidden_dim = hidden_channels if hidden_channels is not None else self.input_dim + self.time_dim
         self.time_mode = time_mode
         self.time_form = time_form
         self.each_proc = each_proc
         self.edge_reverse = edge_reverse
         self.bidirectional = bidirectional
 
-        self.time_dim = {'raw': 1, '2d': 2, 'poly': 3}[time_form]
+        
 
         self.sos_vector = nn.Parameter(torch.zeros(self.time_dim), requires_grad=True)
         self.time_data = (torch.empty_like(event_time)).float()
@@ -124,7 +129,7 @@ class RNNConv(MessagePassing):
                     **rnn_kwargs,
                 )
         print(self.rnn)
-        self.out_channels = hidden_channels * (2 if bidirectional else 1)
+        self.out_channels = self.hidden_dim * (2 if bidirectional else 1)
 
         self.edge_index = edge_index.flip(0) if edge_reverse else edge_index
         assert torch.max(self.edge_index[1]) < event_time.shape[0], f"Edge index max {torch.max(self.edge_index[1])} contains out-of-bounds indices for event_time < {event_time.shape[0]}"
@@ -145,7 +150,7 @@ class RNNConv(MessagePassing):
         self.nanmask = torch.isnan(self.time_data)
         nested_tensors = [torch.tensor(v, dtype=torch.int64) for v in nested_by_entity.values()]
         events_packed = torch.nn.utils.rnn.pack_sequence(nested_tensors, enforce_sorted=False)
-        self.perm = events_packed.data
+        self.register_buffer('perm', events_packed.data)
         self.batch_sizes = events_packed.batch_sizes
         
 
@@ -190,6 +195,7 @@ class RNNConv(MessagePassing):
         -----
         This method internally manages dtype consistency to ensure compatibility with PyTorch autograd mechanisms.
         """
+        assert x.shape[0] == self.num_events, f"Input x has {x.shape[0]} events, but expected {self.num_events} events based on event_time shape {self.time_data.shape}"
         # 1. Build sequence pointers sorted by dst timestamp
         current_dtype = next(self.parameters()).dtype
         the_time__data = self.time_data.to(dtype=current_dtype)  # [num_events]
@@ -203,21 +209,18 @@ class RNNConv(MessagePassing):
             time_delta = self.encode2d(the_time__data.unsqueeze(-1))  # [num_events, 2]
         time_delta[self.nanmask] = self.sos_vector
 
-        #time_delta = time_delta if x.dtype == torch.float else time_delta.to(dtype=x.dtype)
-
         add_time = torch.cat((x, time_delta), dim=-1)
 
         event_prepacked = add_time[self.perm]
 
-        run_packed = torch.nn.utils.rnn.PackedSequence(event_prepacked, batch_sizes=self.batch_sizes.cpu().long())  # [1, num_runs, RUN_POST_COMP]
+        event_packed = torch.nn.utils.rnn.PackedSequence(event_prepacked, batch_sizes=self.batch_sizes.cpu().long())  # [1, num_runs, RUN_POST_COMP]
 
-        run_grued_packed = (self.rnn(run_packed))[0]  # [1, num_runs, RUN_POST_COMP]
+        event_grued_packed = (self.rnn(event_packed))[0]  # [1, num_runs, RUN_POST_COMP]
 
-        run_grued = torch.empty_like(run_grued_packed.data)
+        event_grued = torch.empty_like(event_grued_packed.data)
 
-        #run_grued[self.perm] = run_grued_packed.data
-        run_grued = scatter(run_grued_packed.data, self.perm, dim=0, dim_size=x.size(0), reduce='sum')
+        event_grued = scatter(event_grued_packed.data, self.perm, dim=0, dim_size=x.size(0), reduce='sum')
 
 
-        return run_grued
+        return event_grued
 
